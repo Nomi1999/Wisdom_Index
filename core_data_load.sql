@@ -687,8 +687,9 @@ SELECT
                FROM core.incomes i
                WHERE i.client_id = c.client_id::INTEGER
                  AND i.income_type = 'Salary'
-                 AND ((c.client_id = '1' AND i.income_name ILIKE 'Tom%') OR
-                      (c.client_id = '2' AND i.income_name ILIKE 'Val%'))
+               ORDER BY
+                   (i.income_name ILIKE '%primary%') DESC,
+                   i.income_id ASC                  -- deterministic tie-breaker
                LIMIT 1)
               * 1.0000
               * (substring(c.amount FROM 'first ([0-9.]+)%'))::NUMERIC / 100.0
