@@ -648,59 +648,59 @@ INSERT INTO core.savings (
     start_type,
     end_type,
     amount_type,
-    amount_numeric,
-    amount_frequency,
-    amount_formula,
-    amount_percentage_rate, -- New column for the rate
-    indexed_at_percentage
+    fixed_amount_usd,
+    match_rate_percent,
+    income_cap_percent,
+    calculated_annual_amount_usd,
+    indexed_at_percent
 )
 SELECT
-    client_id::INTEGER,
-    name,
-    destination,
-    account_id,
-    starts AS start_type,
-    ends AS end_type,
-    -- Determine amount type
-    CASE
-        WHEN amount ~ '^[0-9]+$' THEN 'numeric'
-        WHEN amount ~ '\$.*per.*year' THEN 'currency_frequency'
-        WHEN amount ~ '^100\.0% of the first [0-9.]+% of employee''s salary contributed$' THEN 'percentage_formula'
-        ELSE 'unknown'
+    c.client_id::INTEGER,
+    c.name,
+    c.destination,
+    c.account_id,
+    c.starts,
+    c.ends,
+
+    CASE WHEN c.amount LIKE '%100% of the first % of employee%'
+         THEN 'percentage_formula'
+         ELSE 'fixed_usd'
     END AS amount_type,
-    -- Extract absolute numeric value for calculations (NULL for percentage formulas)
-    CASE
-        WHEN amount ~ '^[0-9]+$' THEN amount::NUMERIC
-        WHEN amount ~ '\$([0-9,]+)' THEN REPLACE(REPLACE(SUBSTRING(amount FROM '\$([0-9,]+)'), ',', ''), '$', '')::NUMERIC
-        -- amount_numeric is NULL for percentage_formula as it's not an absolute amount
-        WHEN amount ~ '^100\.0% of the first [0-9.]+% of employee''s salary contributed$' THEN NULL
-        ELSE NULL
-    END AS amount_numeric,
-    -- Extract frequency
-    CASE
-        WHEN amount ~ 'per year' THEN 'per_year'
-        WHEN amount ~ 'annual' THEN 'annual'
-        ELSE 'one_time'
-    END AS amount_frequency,
-    -- Preserve original formula text
-    CASE
-        WHEN amount ~ '^100\.0% of the first [0-9.]+% of employee''s salary contributed$' THEN amount
-        ELSE NULL
-    END AS amount_formula,
-    -- Parse the percentage rate from the formula and store as a decimal (e.g., 4.0 -> 0.04)
-    CASE
-        WHEN amount ~ '^100\.0% of the first ([0-9.]+)% of employee''s salary contributed$' THEN
-            -- Extract the number and divide by 100 to get the decimal rate
-            (SUBSTRING(amount FROM '^100\.0% of the first ([0-9.]+)% of employee''s salary contributed$')::NUMERIC) / 100.0
-        ELSE NULL
-    END AS amount_percentage_rate,
-    -- Parse 'Indexed At' as a percentage (e.g., '0%' -> 0.00)
-    CASE
-        WHEN indexed_at ~ '^[0-9]+\.?[0-9]*%$' THEN -- Check if it looks like a percentage
-            REPLACE(indexed_at, '%', '')::NUMERIC
-        ELSE NULL
-    END AS indexed_at_percentage
-FROM stg.savings;
+
+    CASE WHEN c.amount LIKE '%100% of the first % of employee%'
+         THEN NULL
+         ELSE REPLACE(REGEXP_REPLACE(c.amount, '\$|,(?=[0-9])| per year', '', 'g'), ' ', '')::NUMERIC
+    END AS fixed_amount_usd,
+
+    CASE WHEN c.amount LIKE '%100% of the first % of employee%'
+         THEN 1.0000
+         ELSE NULL
+    END AS match_rate_percent,
+
+    CASE WHEN c.amount LIKE '%100% of the first % of employee%'
+         THEN (substring(c.amount FROM 'first ([0-9.]+)%'))::NUMERIC / 100.0
+         ELSE NULL
+    END AS income_cap_percent,
+
+    CASE WHEN c.amount LIKE '%100% of the first % of employee%'
+         THEN (SELECT i.annual_amount
+               FROM core.incomes i
+               WHERE i.client_id = c.client_id::INTEGER
+                 AND i.income_type = 'Salary'
+                 AND ((c.client_id = '1' AND i.income_name ILIKE 'Tom%') OR
+                      (c.client_id = '2' AND i.income_name ILIKE 'Val%'))
+               LIMIT 1)
+              * 1.0000
+              * (substring(c.amount FROM 'first ([0-9.]+)%'))::NUMERIC / 100.0
+         ELSE REPLACE(REGEXP_REPLACE(c.amount, '\$|,(?=[0-9])| per year', '', 'g'), ' ', '')::NUMERIC
+    END AS calculated_annual_amount_usd,
+
+    CASE WHEN c.indexed_at ~ '[0-9.]+%'
+         THEN REPLACE(c.indexed_at, '%', '')::NUMERIC
+         ELSE NULL
+    END AS indexed_at_percent
+FROM stg.savings c;
+
 
 --values
 -- Insert cleaned data from stg

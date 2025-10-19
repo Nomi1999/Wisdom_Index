@@ -312,19 +312,19 @@ CREATE TABLE IF NOT EXISTS core.real_estate_assets (
 --savings
 -- Create core table
 CREATE TABLE IF NOT EXISTS core.savings (
-    savings_id SERIAL PRIMARY KEY,
-    client_id INTEGER,
-    name TEXT,
-    destination TEXT,
-    account_id TEXT,
-    start_type TEXT,
-    end_type TEXT,
-    amount_type TEXT, -- 'numeric', 'currency_frequency', 'percentage_formula'
-    amount_numeric NUMERIC(20,2), -- For absolute monetary values
-    amount_frequency TEXT, -- 'per_year', 'annual', 'one_time', etc.
-    amount_formula TEXT, -- Original formula text for percentage-based contributions
-    amount_percentage_rate NUMERIC(5,4), -- Store the derived rate as a decimal (e.g., 4.0% -> 0.0400)
-    indexed_at_percentage NUMERIC -- The 'Indexed At' value from the CSV, stored as a decimal (e.g., 0% -> 0.00)
+    savings_id                   SERIAL PRIMARY KEY,
+    client_id                    INTEGER,
+    name                         TEXT,
+    destination                  TEXT,
+    account_id                   TEXT,
+    start_type                   TEXT,
+    end_type                     TEXT,
+    amount_type                  TEXT,            -- 'fixed_usd' | 'percentage_formula'
+    fixed_amount_usd             NUMERIC(20,2),   -- NULL for % rows
+    match_rate_percent           NUMERIC(5,4),    -- 1.0000 when 100 % match
+    income_cap_percent           NUMERIC(5,4),    -- 0.0400 when 4 % cap
+    calculated_annual_amount_usd NUMERIC(20,2),   -- live annual USD
+    indexed_at_percent           NUMERIC(5,2)
 );
 
 --values
