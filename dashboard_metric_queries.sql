@@ -524,3 +524,193 @@ LEFT JOIN actual_living_cte al ON p.client_id = al.client_id;
 
 -- Margin Metric
 --We can calculate this by using : Total Income - Total Expenses. (We already have queries for -----total income and Total expenses).
+
+--Expenses summary view
+CREATE OR REPLACE VIEW core.vw_expense_summary AS
+WITH params AS (
+    SELECT DISTINCT client_id,
+           DATE_TRUNC('year', CURRENT_DATE) AS current_year_start
+    FROM core.expenses
+    UNION
+    SELECT DISTINCT client_id, DATE_TRUNC('year', CURRENT_DATE) FROM core.flows
+    UNION
+    SELECT DISTINCT client_id, DATE_TRUNC('year', CURRENT_DATE) FROM core.savings
+    UNION
+    SELECT DISTINCT client_id, DATE_TRUNC('year', CURRENT_DATE) FROM core.liability_note_accounts
+),
+
+-- Giving
+projected_giving AS (
+    SELECT p.client_id, COALESCE(SUM(e.annual_amount),0) AS projected_giving
+    FROM params p
+    LEFT JOIN core.expenses e ON e.client_id = p.client_id
+    WHERE (LOWER(e.type) LIKE '%giving%' OR LOWER(e.sub_type) LIKE '%giving%' OR LOWER(e.sub_type) LIKE '%charity%')
+      AND e.start_actual_date <= p.current_year_start + INTERVAL '1 year' - INTERVAL '1 day'
+      AND (e.end_projection_date >= p.current_year_start OR e.end_projection_date IS NULL)
+    GROUP BY p.client_id
+),
+actual_giving AS (
+    SELECT p.client_id, COALESCE(SUM(f.amount),0) AS actual_giving
+    FROM params p
+    LEFT JOIN core.flows f ON f.client_id = p.client_id
+    WHERE (LOWER(f.fact_type_name) IN ('other expense','gift') AND (LOWER(f.sub_type) LIKE '%giving%' OR LOWER(f.sub_type) LIKE '%gift%'))
+      AND f.amount_as_of >= p.current_year_start
+      AND f.amount_as_of < p.current_year_start + INTERVAL '1 year'
+    GROUP BY p.client_id
+),
+
+-- Living
+projected_living AS (
+    SELECT p.client_id, COALESCE(SUM(e.annual_amount),0) AS projected_living
+    FROM params p
+    LEFT JOIN core.expenses e ON e.client_id = p.client_id
+    WHERE (LOWER(e.type) IN ('living','spending') AND LOWER(e.sub_type) NOT LIKE '%giving%')
+      AND e.start_actual_date <= p.current_year_start + INTERVAL '1 year' - INTERVAL '1 day'
+      AND (e.end_projection_date >= p.current_year_start OR e.end_projection_date IS NULL)
+    GROUP BY p.client_id
+),
+actual_living AS (
+    SELECT p.client_id, COALESCE(SUM(f.amount),0) AS actual_living
+    FROM params p
+    LEFT JOIN core.flows f ON f.client_id = p.client_id
+    WHERE LOWER(f.fact_type_name) IN ('living expense','education expense','other expense')
+      AND LOWER(f.sub_type) NOT LIKE '%giving%' AND LOWER(f.sub_type) NOT LIKE '%philanthropy%'
+      AND f.amount_as_of >= p.current_year_start
+      AND f.amount_as_of < p.current_year_start + INTERVAL '1 year'
+    GROUP BY p.client_id
+),
+
+-- Taxes
+projected_taxes AS (
+    SELECT p.client_id, COALESCE(SUM(e.annual_amount),0) AS projected_taxes
+    FROM params p
+    LEFT JOIN core.expenses e ON e.client_id = p.client_id
+    WHERE (LOWER(e.type) LIKE '%tax%' OR LOWER(e.sub_type) LIKE '%tax%')
+      AND e.start_actual_date <= p.current_year_start + INTERVAL '1 year' - INTERVAL '1 day'
+      AND (e.end_projection_date >= p.current_year_start OR e.end_projection_date IS NULL)
+    GROUP BY p.client_id
+),
+actual_taxes AS (
+    SELECT p.client_id, COALESCE(SUM(f.amount),0) AS actual_taxes
+    FROM params p
+    LEFT JOIN core.flows f ON f.client_id = p.client_id
+    WHERE LOWER(f.fact_type_name) LIKE '%tax%'
+      AND f.amount_as_of >= p.current_year_start
+      AND f.amount_as_of < p.current_year_start + INTERVAL '1 year'
+    GROUP BY p.client_id
+),
+
+-- Savings
+projected_savings_expenses AS (
+    SELECT p.client_id, COALESCE(SUM(e.annual_amount),0) AS projected_savings_expenses
+    FROM params p
+    LEFT JOIN core.expenses e ON e.client_id = p.client_id
+    WHERE (LOWER(e.type) LIKE '%savings%' OR LOWER(e.sub_type) LIKE '%savings%')
+      AND e.start_actual_date <= p.current_year_start + INTERVAL '1 year' - INTERVAL '1 day'
+      AND (e.end_projection_date >= p.current_year_start OR e.end_projection_date IS NULL)
+    GROUP BY p.client_id
+),
+savings_from_savingstable AS (
+    SELECT p.client_id, COALESCE(SUM(s.fixed_amount_usd),0) AS savings_from_savingstable
+    FROM params p
+    LEFT JOIN core.savings s ON s.client_id = p.client_id
+    WHERE s.start_type = 'Active'
+    GROUP BY p.client_id
+),
+actual_savings AS (
+    SELECT p.client_id, COALESCE(SUM(f.amount),0) AS actual_savings
+    FROM params p
+    LEFT JOIN core.flows f ON f.client_id = p.client_id
+    WHERE LOWER(f.fact_type_name) LIKE '%savings%'
+      AND f.amount_as_of >= p.current_year_start
+      AND f.amount_as_of < p.current_year_start + INTERVAL '1 year'
+    GROUP BY p.client_id
+),
+
+-- Debt
+projected_debt AS (
+    SELECT p.client_id, COALESCE(SUM(e.annual_amount),0) AS projected_debt
+    FROM params p
+    LEFT JOIN core.expenses e ON e.client_id = p.client_id
+    WHERE (
+            LOWER(e.type) LIKE ANY (ARRAY['%loan%','%debt%','%mortgage%','%credit%'])
+         OR LOWER(e.sub_type) LIKE ANY (ARRAY['%loan%','%debt%','%mortgage%','%credit%'])
+          )
+      AND e.start_actual_date <= p.current_year_start + INTERVAL '1 year' - INTERVAL '1 day'
+      AND (e.end_projection_date >= p.current_year_start OR e.end_projection_date IS NULL)
+    GROUP BY p.client_id
+),
+actual_debt AS (
+    SELECT p.client_id, COALESCE(SUM(f.amount),0) AS actual_debt
+    FROM params p
+    LEFT JOIN core.flows f ON f.client_id = p.client_id
+    WHERE LOWER(f.fact_type_name) LIKE ANY (ARRAY['%loan%','%mortgage%','%credit%'])
+      AND f.amount_as_of >= p.current_year_start
+      AND f.amount_as_of < p.current_year_start + INTERVAL '1 year'
+    GROUP BY p.client_id
+),
+liability AS (
+    SELECT p.client_id,
+           COALESCE(SUM(l.total_value),0) AS outstanding_debt,
+           COALESCE(SUM(
+            CASE
+                WHEN l.interest_rate IS NOT NULL AND l.interest_rate > 0 THEN
+                    l.total_value * (l.interest_rate / 12) 
+                    * POWER(1 + l.interest_rate / 12, l.loan_term_in_years * 12) /
+                      (POWER(1 + l.interest_rate / 12, l.loan_term_in_years * 12) - 1) * 12
+                WHEN l.loan_term_in_years IS NOT NULL AND l.loan_term_in_years > 0 THEN
+                    l.total_value / l.loan_term_in_years
+                ELSE 0
+            END
+        ), 0)::NUMERIC(18,2) AS annual_debt_payment
+    FROM params p
+    LEFT JOIN core.liability_note_accounts l ON l.client_id = p.client_id
+    GROUP BY p.client_id
+)
+
+-- Final consolidated output
+SELECT
+    p.client_id,
+    -- Giving
+    COALESCE(pg.projected_giving,0) AS projected_giving,
+    COALESCE(ag.actual_giving,0) AS actual_giving,
+
+    -- Living
+    COALESCE(pl.projected_living,0) AS projected_living,
+    COALESCE(al.actual_living,0) AS actual_living,
+
+    -- Taxes
+    COALESCE(pt.projected_taxes,0) AS projected_taxes,
+    COALESCE(at.actual_taxes,0) AS actual_taxes,
+
+    -- Savings
+    COALESCE(ps.projected_savings_expenses,0) AS projected_savings,
+	COALESCE(ps_tab.savings_from_savingstable,0) AS savings_from_savingstable,
+    COALESCE(asv.actual_savings,0) AS actual_savings,
+
+    -- Debt
+    COALESCE(pd.projected_debt,0) AS projected_debt,
+    COALESCE(ad.actual_debt,0) AS actual_debt,
+    COALESCE(lia.outstanding_debt,0) AS outstanding_debt,
+    COALESCE(lia.annual_debt_payment,0) AS annual_debt_payment,
+
+    -- Totals
+    (COALESCE(pg.projected_giving,0) + COALESCE(pl.projected_living,0) + COALESCE(pt.projected_taxes,0) +
+     COALESCE(ps_tab.savings_from_savingstable,0) + COALESCE(pd.projected_debt,0)) AS projected_total_expenses,
+
+    (COALESCE(ag.actual_giving,0) + COALESCE(al.actual_living,0) + COALESCE(at.actual_taxes,0) +
+     COALESCE(asv.actual_savings,0) + COALESCE(ad.actual_debt,0)) AS actual_total_expenses
+
+FROM params p
+LEFT JOIN projected_giving pg ON p.client_id = pg.client_id
+LEFT JOIN actual_giving ag ON p.client_id = ag.client_id
+LEFT JOIN projected_living pl ON p.client_id = pl.client_id
+LEFT JOIN actual_living al ON p.client_id = al.client_id
+LEFT JOIN projected_taxes pt ON p.client_id = pt.client_id
+LEFT JOIN actual_taxes at ON p.client_id = at.client_id
+LEFT JOIN projected_savings_expenses ps ON p.client_id = ps.client_id
+LEFT JOIN savings_from_savingstable ps_tab ON p.client_id = ps_tab.client_id
+LEFT JOIN actual_savings asv ON p.client_id = asv.client_id
+LEFT JOIN projected_debt pd ON p.client_id = pd.client_id
+LEFT JOIN actual_debt ad ON p.client_id = ad.client_id
+LEFT JOIN liability lia ON p.client_id = lia.client_id;
