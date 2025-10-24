@@ -533,326 +533,529 @@ SELECT (taxable.taxable_investments_usd - umbrella.umbrella_coverage_usd) AS at_
 FROM taxable, umbrella;
 
 --Future Planning Metric
---Retirement ratio:
-SELECT 
- c.client_id,
- c.first_name,
- c.last_name,
- ROUND(
- (
- COALESCE(i.future_income, 0) + 
- COALESCE(a.current_assets, 0) + 
- COALESCE(s.retirement_savings, 0)
- ) / 
- NULLIF(
- (COALESCE(e.future_expenses, 0) + COALESCE(l.current_liabilities, 0)),
- 0
- ),
- 2
- ) AS retirement_ratio
-FROM core.clients c
-LEFT JOIN (
- SELECT client_id, SUM(annual_amount) AS future_income
- FROM core.incomes
- GROUP BY client_id
-) i ON c.client_id = i.client_id
-LEFT JOIN (
- SELECT client_id, SUM(total_value) AS current_assets
- FROM (
- SELECT client_id, total_value FROM core.investment_deposit_accounts
- UNION ALL
- SELECT client_id, total_value FROM core.real_estate_assets
- UNION ALL
- SELECT client_id, total_value FROM core.personal_property_accounts
- ) combined_assets
- GROUP BY client_id
-) a ON c.client_id = a.client_id
-LEFT JOIN (
- SELECT client_id, 
- SUM(COALESCE(calculated_annual_amount_usd, fixed_amount_usd)) AS 
-retirement_savings
- FROM core.savings
- GROUP BY client_id
-) s ON c.client_id = s.client_id
-LEFT JOIN (
- SELECT client_id, SUM(annual_amount) AS future_expenses
- FROM core.expenses
- GROUP BY client_id
-) e ON c.client_id = e.client_id
-LEFT JOIN (
- SELECT client_id, SUM(total_value) AS current_liabilities
- FROM core.liability_note_accounts
- GROUP BY client_id
-) l ON c.client_id = l.client_id
 
---Survivor ratio:
-SELECT 
- c.client_id,
- c.first_name,
- c.last_name,
- ROUND(
- (
- COALESCE(life_ins.life_insurance_value, 0) +
- COALESCE(i.future_income, 0) + 
- COALESCE(a.current_assets, 0)
- ) /
- NULLIF(
- (COALESCE(e.future_expenses, 0) + COALESCE(li.current_liabilities, 0)),
- 0
- ),
- 2
- ) AS survivor_ratio
-FROM core.clients c
--- Future Income
-LEFT JOIN (
- SELECT client_id, SUM(annual_amount) AS future_income
- FROM core.incomes
- GROUP BY client_id
-) i ON c.client_id = i.client_id
--- Current Assets (Investment + Real Estate + Personal Property)
-LEFT JOIN (
- SELECT client_id, SUM(total_value) AS current_assets
- FROM (
- SELECT client_id, total_value FROM core.investment_deposit_accounts
- UNION ALL
- SELECT client_id, total_value FROM core.real_estate_assets
- UNION ALL
- SELECT client_id, total_value FROM core.personal_property_accounts
- ) combined_assets
- GROUP BY client_id
-) a ON c.client_id = a.client_id
--- Life Insurance (Death Benefit)
-LEFT JOIN (
- SELECT client_id, SUM(death_benefit) AS life_insurance_value
- FROM core.life_insurance_annuity_accounts
- GROUP BY client_id
-) life_ins ON c.client_id = life_ins.client_id
--- Future Expenses
-LEFT JOIN (
- SELECT client_id, SUM(annual_amount) AS future_expenses
- FROM core.expenses
- GROUP BY client_id
-) e ON c.client_id = e.client_id
--- Current Liabilities
-LEFT JOIN (
- SELECT client_id, SUM(total_value) AS current_liabilities
- FROM core.liability_note_accounts
- GROUP BY client_id
-) li ON c.client_id = li.client_id;
-SELECT 
- c.client_id,
- c.first_name,
- c.last_name,
- ROUND(
- (
- COALESCE(s.education_savings, 0) +
- COALESCE(a.education_accounts, 0)
- ) /
- NULLIF(COALESCE(e.education_expenses, 0), 0),
- 2
- ) AS education_ratio
-FROM core.clients c
+-- Retirement Ratio (Corrected Version)
+WITH 
+-- Get client information and calculate current age
+client_info AS (
+    SELECT 
+        c.client_id,
+        EXTRACT(YEAR FROM AGE(CURRENT_DATE, c.hh_date_of_birth)) AS current_age,
+        65 AS retirement_age
+    FROM core.clients c
+    WHERE c.client_id = {{client_id}}
+),
 
--- Education Savings (savings accounts with education destination)
-SELECT 
- c.client_id,
- c.first_name,
- c.last_name,
- ROUND(
- (
- COALESCE(s.education_savings, 0) +
- COALESCE(a.education_accounts, 0)
- ) /
- NULLIF(COALESCE(e.education_expenses, 0), 0),
- 2
- ) AS education_ratio
-FROM core.clients c
--- Education Savings
-LEFT JOIN (
- SELECT 
- client_id,
- SUM(COALESCE(calculated_annual_amount_usd, fixed_amount_usd)) AS 
-education_savings
- FROM core.savings
- WHERE LOWER(destination) LIKE '%education%'
- GROUP BY client_id
-) s ON c.client_id = s.client_id
--- Current Education Accounts
-LEFT JOIN (
- SELECT 
- client_id,
- SUM(total_value) AS education_accounts
- FROM (
- -- Investment accounts with subtype containing 'education'
- SELECT client_id, total_value 
- FROM core.investment_deposit_accounts
- WHERE LOWER(sub_type) LIKE '%education%'
- 
- UNION ALL
- 
- -- Personal property accounts (include all — no subtype field)
- SELECT client_id, total_value 
- FROM core.personal_property_accounts
- ) AS edu_accounts
- GROUP BY client_id
-) a ON c.client_id = a.client_id
--- Future Education Expenses
-LEFT JOIN (
- SELECT 
- client_id,
- SUM(annual_amount) AS education_expenses
- FROM core.expenses
- WHERE LOWER(type) LIKE '%education%'
- OR LOWER(sub_type) LIKE '%education%'
- OR LOWER(expense_item) LIKE '%education%'
- GROUP BY client_id
-) e ON c.client_id = e.client_id;
+-- Calculate present value of future income streams
+future_income_pv AS (
+    SELECT 
+        i.client_id,
+        SUM(
+            CASE 
+                -- Income that continues into retirement years
+                WHEN (ci.retirement_age - ci.current_age) > 0 AND
+                     (i.end_type IS NULL OR 
+                      i.end_type != 'Age' OR
+                      (i.end_type = 'Age' AND i.end_value > ci.retirement_age))
+                THEN i.annual_amount * 
+                     (1 - POWER(1.0/1.04, GREATEST(0, ci.retirement_age - ci.current_age))) / 0.04
+                ELSE 0
+            END
+        ) AS pv_future_income
+    FROM core.incomes i
+    JOIN client_info ci ON i.client_id = ci.client_id
+    WHERE i.deleted IS NULL OR i.deleted = false
+    GROUP BY i.client_id
+),
 
---Cars
-SELECT 
- c.client_id,
- c.first_name,
- c.last_name,
- ROUND(
- (
- COALESCE(t.taxable_account_value, 0) + 
- COALESCE(s.taxable_savings, 0)
- ) / 
- NULLIF(COALESCE(e.future_car_expenses, 0), 0),
- 2
- ) AS new_cars_ratio
-FROM core.clients c
--- taxable accounts (investment accounts flagged taxable + personal property accounts with car in name)
-LEFT JOIN (
- SELECT client_id, SUM(total_value) AS taxable_account_value
- FROM (
- -- investment/deposit accounts that look taxable
- SELECT client_id, total_value
- FROM core.investment_deposit_accounts
- WHERE LOWER(COALESCE(sub_type, '')) LIKE '%taxable%'
- OR LOWER(COALESCE(account_name, '')) LIKE '%taxable%'
- UNION ALL
- -- personal property accounts where the account_name suggests a car
- SELECT client_id, total_value
- FROM core.personal_property_accounts
- WHERE LOWER(COALESCE(account_name, '')) LIKE '%car%'
- OR LOWER(COALESCE(account_name, '')) LIKE '%vehicle%'
- OR LOWER(COALESCE(account_name, '')) LIKE '%auto%'
- ) AS taxable_union
- GROUP BY client_id
-) t ON c.client_id = t.client_id
--- taxable savings (fallback: any savings that are not explicitly retirement or education)
-LEFT JOIN (
- SELECT client_id, 
- SUM(COALESCE(calculated_annual_amount_usd, fixed_amount_usd, 0)) AS 
-taxable_savings
- FROM core.savings
- WHERE NOT (
- LOWER(COALESCE(destination, '')) LIKE '%retirement%'
- OR LOWER(COALESCE(destination, '')) LIKE '%education%'
- )
- GROUP BY client_id
-) s ON c.client_id = s.client_id
--- future car expenses (look for car/vehicle/auto keywords in expense_item/type/sub_type)
-LEFT JOIN (
- SELECT client_id, SUM(annual_amount) AS future_car_expenses
- FROM core.expenses
- WHERE LOWER(COALESCE(expense_item, '')) LIKE '%car%'
- OR LOWER(COALESCE(expense_item, '')) LIKE '%vehicle%'
- OR LOWER(COALESCE(expense_item, '')) LIKE '%auto%'
- OR LOWER(COALESCE(type, '')) LIKE '%car%'
- OR LOWER(COALESCE(type, '')) LIKE '%vehicle%'
- OR LOWER(COALESCE(type, '')) LIKE '%auto%'
- OR LOWER(COALESCE(sub_type, '')) LIKE '%car%'
- OR LOWER(COALESCE(sub_type, '')) LIKE '%vehicle%'
- OR LOWER(COALESCE(sub_type, '')) LIKE '%auto%'
- GROUP BY client_id
-) e ON c.client_id = e.client_id;
+-- Calculate present value of future expenses
+future_expenses_pv AS (
+    SELECT 
+        e.client_id,
+        SUM(
+            CASE 
+                -- Expenses that continue into retirement years
+                WHEN (ci.retirement_age - ci.current_age) > 0 AND
+                     (e.end_type IS NULL OR 
+                      e.end_type != 'Age' OR
+                      (e.end_type = 'Age' AND 
+                       EXTRACT(YEAR FROM AGE(e.end_actual_date, e.start_actual_date)) > (ci.retirement_age - ci.current_age)))
+                THEN e.annual_amount * 
+                     (1 - POWER(1.0/1.04, GREATEST(0, ci.retirement_age - ci.current_age))) / 0.04
+                ELSE 0
+            END
+        ) AS pv_future_expenses
+    FROM core.expenses e
+    JOIN client_info ci ON e.client_id = ci.client_id
+    GROUP BY e.client_id
+),
 
---LTC
-SELECT 
- c.client_id,
- c.first_name,
- c.last_name,
- ROUND(
- (
- COALESCE(i.future_income, 0) + 
- COALESCE(a.total_assets, 0)
- ) / 
- NULLIF(
- (COALESCE(e.future_expenses, 0) + COALESCE(l.ltc_expenses, 0)),
- 0
- ),
- 2
- ) AS ltc_ratio
-FROM core.clients c
--- Income: Sum of all income streams
-LEFT JOIN (
- SELECT client_id, SUM(annual_amount) AS future_income
- FROM core.incomes
- GROUP BY client_id
-) i ON c.client_id = i.client_id
--- Assets: Combine investment, real estate, and personal property
-LEFT JOIN (
- SELECT client_id, SUM(total_value) AS total_assets
- FROM (
- SELECT client_id, total_value FROM core.investment_deposit_accounts
- UNION ALL
- SELECT client_id, total_value FROM core.real_estate_assets
- UNION ALL
- SELECT client_id, total_value FROM core.personal_property_accounts
- ) assets
- GROUP BY client_id
-) a ON c.client_id = a.client_id
--- Future Expenses: All regular (non-LTC) expenses
-LEFT JOIN (
- SELECT client_id, SUM(annual_amount) AS future_expenses
- FROM core.expenses
- WHERE LOWER(COALESCE(type, '')) NOT LIKE '%ltc%'
- AND LOWER(COALESCE(expense_item, '')) NOT LIKE '%long term care%'
- GROUP BY client_id
-) e ON c.client_id = e.client_id
--- LTC Expenses: Sum of premiums or benefit costs from LTC insurance
-LEFT JOIN (
- SELECT client_id, 
- SUM(COALESCE(annual_premium, 0) + COALESCE(benefit_amount, 0)) AS ltc_expenses
- FROM core.disability_ltc_insurance_accounts
- WHERE LOWER(COALESCE(sub_type, '')) LIKE '%ltc%'
- OR LOWER(COALESCE(fact_type_name, '')) LIKE '%long term care%'
- GROUP BY client_id
-) l ON c.client_id = l.client_id;
+-- Current assets (excluding retirement savings)
+current_assets AS (
+    SELECT 
+        client_id,
+        SUM(total_value) AS current_assets
+    FROM (
+        SELECT client_id, total_value FROM core.investment_deposit_accounts
+        UNION ALL
+        SELECT client_id, total_value FROM core.real_estate_assets  
+        UNION ALL
+        SELECT client_id, total_value FROM core.personal_property_accounts
+    ) all_assets
+    GROUP BY client_id
+),
 
---LTD
+-- Retirement-specific savings
+retirement_savings AS (
+    SELECT 
+        client_id,
+        SUM(COALESCE(calculated_annual_amount_usd, fixed_amount_usd)) AS retirement_savings
+    FROM core.savings
+    WHERE destination ILIKE '%retirement%' OR 
+          destination ILIKE '%401k%' OR 
+          destination ILIKE '%ira%' OR
+          account_id ILIKE '%retirement%' OR
+          account_id ILIKE '%401k%' OR
+          account_id ILIKE '%ira%'
+    GROUP BY client_id
+),
+
+-- Current liabilities
+current_liabilities AS (
+    SELECT 
+        client_id,
+        SUM(total_value) AS current_liabilities
+    FROM core.liability_note_accounts
+    GROUP BY client_id
+)
+
+-- Final retirement ratio calculation
 SELECT 
- c.client_id,
- c.first_name,
- c.last_name,
- ROUND(
- COALESCE(l.ltd_value, 0) / NULLIF(COALESCE(i.earned_income, 0), 0),
- 2
- ) AS ltd_ratio
-FROM core.clients c
--- LTD value (current value of LTD accounts)
-LEFT JOIN (
- SELECT client_id,
- SUM(total_value) AS ltd_value
- FROM core.disability_ltc_insurance_accounts
- WHERE LOWER(COALESCE(sub_type, '')) LIKE '%ltd%'
- OR LOWER(COALESCE(fact_type_name, '')) LIKE '%long term disability%'
- GROUP BY client_id
-) l ON c.client_id = l.client_id
--- Current earned income (from income table)
-LEFT JOIN (
- SELECT client_id,
- SUM(annual_amount) AS earned_income
- FROM core.incomes
- WHERE LOWER(COALESCE(income_type, '')) LIKE '%salary%'
- OR LOWER(COALESCE(income_type, '')) LIKE '%wage%'
- OR LOWER(COALESCE(income_type, '')) LIKE '%earned%'
- OR LOWER(COALESCE(income_name, '')) LIKE '%salary%'
- OR LOWER(COALESCE(income_name, '')) LIKE '%wage%'
- OR LOWER(COALESCE(income_name, '')) LIKE '%earned%'
- GROUP BY client_id
-) i ON c.client_id = i.client_id;
+    ROUND(
+        (
+            COALESCE(fi.pv_future_income, 0) + 
+            COALESCE(ca.current_assets, 0) + 
+            COALESCE(rs.retirement_savings, 0)
+        ) / 
+        NULLIF(
+            (COALESCE(fe.pv_future_expenses, 0) + COALESCE(cl.current_liabilities, 0)),
+            0
+        ),
+        2
+    ) AS retirement_ratio
+FROM client_info ci
+LEFT JOIN future_income_pv fi ON ci.client_id = fi.client_id
+LEFT JOIN future_expenses_pv fe ON ci.client_id = fe.client_id
+LEFT JOIN current_assets ca ON ci.client_id = ca.client_id
+LEFT JOIN retirement_savings rs ON ci.client_id = rs.client_id
+LEFT JOIN current_liabilities cl ON ci.client_id = cl.client_id
+WHERE ci.current_age < ci.retirement_age;
+
+
+-- Survivor Ratio (Corrected Version)
+WITH 
+-- Get client information and calculate current age
+client_info AS (
+    SELECT 
+        c.client_id,
+        EXTRACT(YEAR FROM AGE(CURRENT_DATE, c.hh_date_of_birth)) AS current_age
+    FROM core.clients c
+    WHERE c.client_id = {{client_id}}
+),
+
+-- Calculate present value of future income streams (post-death scenario)
+future_income_pv AS (
+    SELECT 
+        i.client_id,
+        SUM(
+            CASE 
+                -- Income that continues after death (spouse income, survivor benefits, etc.)
+                WHEN (i.end_type = 'SpousesDeath' OR i.owner_type = 'Spouse') AND
+                     (i.end_value IS NULL OR i.end_value > EXTRACT(YEAR FROM CURRENT_DATE))
+                THEN i.annual_amount * 
+                     (1 - POWER(1.0/1.04, 20)) / 0.04  -- 20-year planning horizon
+                ELSE 0
+            END
+        ) AS pv_future_income
+    FROM core.incomes i
+    JOIN client_info ci ON i.client_id = ci.client_id
+    WHERE (i.deleted IS NULL OR i.deleted = false)
+    GROUP BY i.client_id
+),
+
+-- Calculate present value of future expenses (post-death scenario)
+future_expenses_pv AS (
+    SELECT 
+        e.client_id,
+        SUM(
+            CASE 
+                -- Expenses that continue after death (ongoing living expenses, etc.)
+                WHEN e.end_type != 'AtSecondDeath' AND
+                     (e.end_actual_date IS NULL OR e.end_actual_date > CURRENT_DATE)
+                THEN e.annual_amount * 
+                     (1 - POWER(1.0/1.04, 20)) / 0.04  -- 20-year planning horizon
+                ELSE 0
+            END
+        ) AS pv_future_expenses
+    FROM core.expenses e
+    JOIN client_info ci ON e.client_id = ci.client_id
+    GROUP BY e.client_id  -- Fixed: was i.client_id, now e.client_id
+),
+
+-- Current assets
+current_assets AS (
+    SELECT 
+        client_id,
+        SUM(total_value) AS current_assets
+    FROM (
+        SELECT client_id, total_value FROM core.investment_deposit_accounts
+        UNION ALL
+        SELECT client_id, total_value FROM core.real_estate_assets  
+        UNION ALL
+        SELECT client_id, total_value FROM core.personal_property_accounts
+    ) all_assets
+    GROUP BY client_id
+),
+
+-- Life insurance death benefits
+life_insurance AS (
+    SELECT 
+        client_id,
+        SUM(death_benefit) AS life_insurance_value
+    FROM core.life_insurance_annuity_accounts
+    WHERE death_benefit IS NOT NULL AND death_benefit > 0
+    GROUP BY client_id
+),
+
+-- Current liabilities (note: these are negative values in the data)
+current_liabilities AS (
+    SELECT 
+        client_id,
+        ABS(SUM(total_value)) AS current_liabilities  -- Convert to positive for calculation
+    FROM core.liability_note_accounts
+    GROUP BY client_id
+)
+
+-- Final survivor ratio calculation
+SELECT 
+    ROUND(
+        (
+            COALESCE(li.life_insurance_value, 0) +
+            COALESCE(fi.pv_future_income, 0) + 
+            COALESCE(ca.current_assets, 0)
+        ) / 
+        NULLIF(
+            (COALESCE(fe.pv_future_expenses, 0) + COALESCE(cl.current_liabilities, 0)),
+            0
+        ),
+        2
+    ) AS survivor_ratio
+FROM client_info ci
+LEFT JOIN future_income_pv fi ON ci.client_id = fi.client_id
+LEFT JOIN future_expenses_pv fe ON ci.client_id = fe.client_id
+LEFT JOIN current_assets ca ON ci.client_id = ca.client_id
+LEFT JOIN life_insurance li ON ci.client_id = li.client_id
+LEFT JOIN current_liabilities cl ON ci.client_id = cl.client_id;
+
+
+-- Education Ratio (Corrected Version)
+WITH 
+-- Get client information
+client_info AS (
+    SELECT 
+        c.client_id
+    FROM core.clients c
+    WHERE c.client_id = {{client_id}}
+),
+
+-- Calculate present value of education savings (annual contributions)
+education_savings_pv AS (
+    SELECT 
+        s.client_id,
+        SUM(
+            CASE 
+                WHEN s.destination ILIKE '%education%'
+                THEN COALESCE(s.calculated_annual_amount_usd, s.fixed_amount_usd) * 
+                     (1 - POWER(1.0/1.04, 10)) / 0.04  -- 10-year education planning horizon
+                ELSE 0
+            END
+        ) AS pv_education_savings
+    FROM core.savings s
+    JOIN client_info ci ON s.client_id = ci.client_id
+    GROUP BY s.client_id
+),
+
+-- Current education account balances
+education_accounts AS (
+    SELECT 
+        client_id,
+        SUM(total_value) AS education_account_balances
+    FROM (
+        -- Investment accounts with education subtype
+        SELECT client_id, total_value 
+        FROM core.investment_deposit_accounts
+        WHERE sub_type ILIKE '%education%'
+        
+        UNION ALL
+        
+        -- Personal property accounts (all included as they may contain education assets)
+        SELECT client_id, total_value 
+        FROM core.personal_property_accounts
+    ) edu_accounts
+    GROUP BY client_id
+),
+
+-- Calculate present value of future education expenses
+education_expenses_pv AS (
+    SELECT 
+        e.client_id,
+        SUM(
+            CASE 
+                WHEN e.type ILIKE '%education%' OR 
+                     e.sub_type ILIKE '%education%' OR 
+                     e.expense_item ILIKE '%education%'
+                THEN e.annual_amount * 
+                     (1 - POWER(1.0/1.04, 10)) / 0.04  -- 10-year education planning horizon
+                ELSE 0
+            END
+        ) AS pv_education_expenses
+    FROM core.expenses e
+    JOIN client_info ci ON e.client_id = ci.client_id
+    GROUP BY e.client_id
+)
+
+-- Final education ratio calculation
+SELECT 
+    ROUND(
+        (
+            COALESCE(es.pv_education_savings, 0) +
+            COALESCE(ea.education_account_balances, 0)
+        ) / 
+        NULLIF(COALESCE(ee.pv_education_expenses, 0), 0),
+        2
+    ) AS education_ratio
+FROM client_info ci
+LEFT JOIN education_savings_pv es ON ci.client_id = es.client_id
+LEFT JOIN education_accounts ea ON ci.client_id = ea.client_id
+LEFT JOIN education_expenses_pv ee ON ci.client_id = ee.client_id;
+
+
+-- New Cars Ratio (Corrected Version)
+WITH 
+-- Get client information
+client_info AS (
+    SELECT 
+        c.client_id
+    FROM core.clients c
+    WHERE c.client_id = {{client_id}}
+),
+
+-- Current taxable account balances (investment accounts flagged as taxable)
+taxable_accounts AS (
+    SELECT 
+        client_id,
+        SUM(total_value) AS taxable_account_value
+    FROM core.investment_deposit_accounts
+    WHERE sub_type ILIKE '%taxable%' 
+       OR account_name ILIKE '%taxable%'
+       OR account_name ILIKE '%brokerage%'
+    GROUP BY client_id
+),
+
+-- Calculate present value of taxable savings (annual contributions to taxable accounts)
+taxable_savings_pv AS (
+    SELECT 
+        s.client_id,
+        SUM(
+            CASE 
+                WHEN NOT (s.destination ILIKE '%retirement%' OR s.destination ILIKE '%education%')
+                THEN COALESCE(s.calculated_annual_amount_usd, s.fixed_amount_usd) * 
+                     (1 - POWER(1.0/1.04, 5)) / 0.04  -- 5-year car planning horizon
+                ELSE 0
+            END
+        ) AS pv_taxable_savings
+    FROM core.savings s
+    JOIN client_info ci ON s.client_id = ci.client_id
+    GROUP BY s.client_id
+),
+
+-- Calculate present value of future car expenses
+car_expenses_pv AS (
+    SELECT 
+        e.client_id,
+        SUM(
+            CASE 
+                WHEN e.expense_item ILIKE '%car%' OR 
+                     e.expense_item ILIKE '%vehicle%' OR 
+                     e.expense_item ILIKE '%auto%' OR
+                     e.type ILIKE '%car%' OR 
+                     e.type ILIKE '%vehicle%' OR 
+                     e.type ILIKE '%auto%' OR
+                     e.sub_type ILIKE '%car%' OR 
+                     e.sub_type ILIKE '%vehicle%' OR 
+                     e.sub_type ILIKE '%auto%'
+                THEN e.annual_amount * 
+                     (1 - POWER(1.0/1.04, 5)) / 0.04  -- 5-year car planning horizon
+                ELSE 0
+            END
+        ) AS pv_car_expenses
+    FROM core.expenses e
+    JOIN client_info ci ON e.client_id = ci.client_id
+    GROUP BY e.client_id
+)
+
+-- Final new cars ratio calculation
+SELECT 
+    ROUND(
+        (
+            COALESCE(ta.taxable_account_value, 0) + 
+            COALESCE(ts.pv_taxable_savings, 0)
+        ) / 
+        NULLIF(COALESCE(ce.pv_car_expenses, 0), 0),
+        2
+    ) AS new_cars_ratio
+FROM client_info ci
+LEFT JOIN taxable_accounts ta ON ci.client_id = ta.client_id
+LEFT JOIN taxable_savings_pv ts ON ci.client_id = ts.client_id
+LEFT JOIN car_expenses_pv ce ON ci.client_id = ce.client_id;
+
+
+-- LTC Ratio (Corrected Version)
+WITH 
+-- Get client information
+client_info AS (
+    SELECT 
+        c.client_id
+    FROM core.clients c
+    WHERE c.client_id = {{client_id}}
+),
+
+-- Calculate present value of all future income streams
+future_income_pv AS (
+    SELECT 
+        i.client_id,
+        SUM(
+            CASE 
+                WHEN (i.deleted IS NULL OR i.deleted = false)
+                THEN i.annual_amount * 
+                     (1 - POWER(1.0/1.04, 20)) / 0.04  -- 20-year planning horizon for LTC
+                ELSE 0
+            END
+        ) AS pv_future_income
+    FROM core.incomes i
+    JOIN client_info ci ON i.client_id = ci.client_id
+    GROUP BY i.client_id
+),
+
+-- Current assets (investment + real estate + personal property)
+current_assets AS (
+    SELECT 
+        client_id,
+        SUM(total_value) AS total_assets
+    FROM (
+        SELECT client_id, total_value FROM core.investment_deposit_accounts
+        UNION ALL
+        SELECT client_id, total_value FROM core.real_estate_assets  
+        UNION ALL
+        SELECT client_id, total_value FROM core.personal_property_accounts
+    ) all_assets
+    GROUP BY client_id
+),
+
+-- Calculate present value of future regular expenses (excluding LTC)
+future_expenses_pv AS (
+    SELECT 
+        e.client_id,
+        SUM(
+            CASE 
+                WHEN NOT (e.type ILIKE '%ltc%' OR e.expense_item ILIKE '%long term care%')
+                THEN e.annual_amount * 
+                     (1 - POWER(1.0/1.04, 20)) / 0.04  -- 20-year planning horizon
+                ELSE 0
+            END
+        ) AS pv_future_expenses
+    FROM core.expenses e
+    JOIN client_info ci ON e.client_id = ci.client_id
+    GROUP BY e.client_id
+),
+
+-- Calculate present value of future LTC expenses (premiums only)
+ltc_expenses_pv AS (
+    SELECT 
+        l.client_id,
+        SUM(
+            CASE 
+                WHEN l.sub_type ILIKE '%ltc%' OR l.fact_type_name ILIKE '%long term care%'
+                THEN COALESCE(l.annual_premium, 0) * 
+                     (1 - POWER(1.0/1.04, 20)) / 0.04  -- 20-year planning horizon
+                ELSE 0
+            END
+        ) AS pv_ltc_expenses
+    FROM core.disability_ltc_insurance_accounts l
+    JOIN client_info ci ON l.client_id = ci.client_id
+    GROUP BY l.client_id
+)
+
+-- Final LTC ratio calculation
+SELECT 
+    ROUND(
+        (
+            COALESCE(fi.pv_future_income, 0) + 
+            COALESCE(ca.total_assets, 0)
+        ) / 
+        NULLIF(
+            (COALESCE(fe.pv_future_expenses, 0) + COALESCE(le.pv_ltc_expenses, 0)),
+            0
+        ),
+        2
+    ) AS ltc_ratio
+FROM client_info ci
+LEFT JOIN future_income_pv fi ON ci.client_id = fi.client_id
+LEFT JOIN current_assets ca ON ci.client_id = ca.client_id
+LEFT JOIN future_expenses_pv fe ON ci.client_id = fe.client_id
+LEFT JOIN ltc_expenses_pv le ON ci.client_id = le.client_id;
+
+
+-- LTD Ratio (Corrected Version)
+WITH 
+-- Get client information
+client_info AS (
+    SELECT 
+        c.client_id
+    FROM core.clients c
+    WHERE c.client_id = {{client_id}}
+),
+
+-- LTD value (current value/benefit amount of LTD policies)
+ltd_value AS (
+    SELECT 
+        client_id,
+        SUM(COALESCE(benefit_amount, 0)) AS ltd_value
+    FROM core.disability_ltc_insurance_accounts
+    WHERE fact_type_name ILIKE '%disability%'
+    GROUP BY client_id
+),
+
+-- Current earned income (salary/wage income for current year)
+earned_income AS (
+    SELECT 
+        client_id,
+        SUM(COALESCE(current_year_amount, 0)) AS earned_income
+    FROM core.incomes
+    WHERE income_type = 'Salary' 
+      AND (deleted IS NULL OR deleted = false)
+    GROUP BY client_id
+)
+
+-- Final LTD ratio calculation
+SELECT 
+    ROUND(
+        COALESCE(l.ltd_value, 0) / NULLIF(COALESCE(e.earned_income, 0), 0),
+        2
+    ) AS ltd_ratio
+FROM client_info ci
+LEFT JOIN ltd_value l ON ci.client_id = l.client_id
+LEFT JOIN earned_income e ON ci.client_id = e.client_id;
+
 
 
